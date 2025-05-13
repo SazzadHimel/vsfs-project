@@ -1,212 +1,205 @@
 #include <stdio.h>
 #include <stdint.h>
-#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define BLOCK_SIZE 4096
 #define TOTAL_BLOCKS 64
-#define INODE_COUNT 80
-#define INODE_BITMAP_BLOCK 1
-#define DATA_BITMAP_BLOCK 2
-#define INODE_TABLE_START_BLOCK 3
-#define FIRST_DATA_BLOCK 8
 #define INODE_SIZE 256
-#define MAGIC_NUMBER 0xD34D
+#define INODES_PER_BLOCK (BLOCK_SIZE / INODE_SIZE)
+#define INODE_TABLE_BLOCKS 5
+#define INODE_COUNT (INODE_TABLE_BLOCKS * INODES_PER_BLOCK)
 
-// Mocked bitmap arrays for example (normally you'd read from disk image)
-bool inode_bitmap[INODE_COUNT] = {false};
-bool data_bitmap[TOTAL_BLOCKS] = {false};
-int data_block_ref_count[TOTAL_BLOCKS] = {0};
+#define MAGIC 0xD34D
 
-// Mocked structure for superblock
 typedef struct {
-    uint16_t magic_number;
+    uint16_t magic;
     uint32_t block_size;
     uint32_t total_blocks;
     uint32_t inode_bitmap_block;
     uint32_t data_bitmap_block;
     uint32_t inode_table_start;
-    uint32_t first_data_block;
+    uint32_t data_block_start;
     uint32_t inode_size;
     uint32_t inode_count;
-} Superblock;
+    uint8_t reserved[4058];
+} __attribute__((packed)) Superblock;
 
 typedef struct {
-    int number;
-    bool valid;
-    int block_refs[12];
-    int num_blocks;
-    int link_count;
-    bool deleted;
-    int single_indirect;
-    int double_indirect;
-} Inode;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t size;
+    uint32_t atime;
+    uint32_t ctime;
+    uint32_t mtime;
+    uint32_t dtime;
+    uint32_t links_count;
+    uint32_t blocks;
+    uint32_t direct_block;
+    uint32_t single_indirect;
+    uint32_t double_indirect;
+    uint32_t triple_indirect;
+    uint8_t reserved[156];
+} __attribute__((packed)) Inode;
 
-Inode inodes[INODE_COUNT]; // Mocked inode array
+Superblock sb;
+Inode inodes[INODE_COUNT];
+uint8_t inode_bitmap[BLOCK_SIZE];
+uint8_t data_bitmap[BLOCK_SIZE];
+uint8_t data_block_owner[TOTAL_BLOCKS];
 
-// Counters for summary
-int superblock_errors = 0;
-int inode_bitmap_errors = 0;
-int data_bitmap_errors = 0;
-int duplicate_blocks = 0;
-int bad_block_references = 0;
-int valid_inodes = 0;
-int used_data_blocks = 0;
-int indirect_blocks = 0;
-int orphaned_inodes = 0;
-int orphaned_data_blocks = 0;
+FILE* img;
 
-void print_superblock(Superblock sb) {
-    printf("=== SUPERBLOCK INFORMATION ===\n");
-    printf("Magic Number: 0x%X\n", sb.magic_number);
-    printf("Block Size: %d bytes\n", sb.block_size);
-    printf("Total Blocks: %d\n", sb.total_blocks);
-    printf("Inode Bitmap Block: %d\n", sb.inode_bitmap_block);
-    printf("Data Bitmap Block: %d\n", sb.data_bitmap_block);
-    printf("Inode Table Start Block: %d\n", sb.inode_table_start);
-    printf("First Data Block: %d\n", sb.first_data_block);
-    printf("Inode Size: %d bytes\n", sb.inode_size);
-    printf("Inode Count: %d\n", sb.inode_count);
-    printf("All superblock checks passed!\n\n");
+void read_block(int block_num, void* buf) {
+    fseek(img, block_num * BLOCK_SIZE, SEEK_SET);
+    fread(buf, BLOCK_SIZE, 1, img);
 }
 
-void check_inode_bitmap() {
-    printf("=== INODE BITMAP CHECK ===\n");
+void write_block(int block_num, void* buf) {
+    fseek(img, block_num * BLOCK_SIZE, SEEK_SET);
+    fwrite(buf, BLOCK_SIZE, 1, img);
+}
+
+void load_data() {
+    read_block(0, &sb);
+    read_block(sb.inode_bitmap_block, inode_bitmap);
+    read_block(sb.data_bitmap_block, data_bitmap);
+    for (int i = 0; i < INODE_TABLE_BLOCKS; i++) {
+        uint8_t block[BLOCK_SIZE];
+        read_block(sb.inode_table_start + i, block);
+        for (int j = 0; j < INODES_PER_BLOCK; j++) {
+            memcpy(&inodes[i * INODES_PER_BLOCK + j], block + j * INODE_SIZE, INODE_SIZE);
+        }
+    }
+}
+
+void save_inodes() {
+    for (int i = 0; i < INODE_TABLE_BLOCKS; i++) {
+        uint8_t block[BLOCK_SIZE];
+        for (int j = 0; j < INODES_PER_BLOCK; j++) {
+            memcpy(block + j * INODE_SIZE, &inodes[i * INODES_PER_BLOCK + j], INODE_SIZE);
+        }
+        write_block(sb.inode_table_start + i, block);
+    }
+}
+
+void fix_superblock() {
+    printf("[INFO] Checking superblock...\n");
+    int FIXING = 0;
+    if (sb.magic != MAGIC) {
+        printf("[FIXING] Magic number corrected from 0x%X to 0x%X\n", sb.magic, MAGIC);
+        sb.magic = MAGIC; FIXING = 1;
+    }
+    if (sb.block_size != BLOCK_SIZE) {
+        printf("[FIXING] Block size corrected from %u to %u\n", sb.block_size, BLOCK_SIZE);
+        sb.block_size = BLOCK_SIZE; FIXING = 1;
+    }
+    if (sb.total_blocks != TOTAL_BLOCKS) {
+        printf("[FIXING] Total blocks corrected from %u to %u\n", sb.total_blocks, TOTAL_BLOCKS);
+        sb.total_blocks = TOTAL_BLOCKS; FIXING = 1;
+    }
+    if (sb.inode_bitmap_block != 1 || sb.data_bitmap_block != 2 ||
+        sb.inode_table_start != 3 || sb.data_block_start != 8) {
+        printf("[FIXING] Corrected superblock block pointers\n");
+        sb.inode_bitmap_block = 1;
+        sb.data_bitmap_block = 2;
+        sb.inode_table_start = 3;
+        sb.data_block_start = 8;
+        FIXING = 1;
+    }
+    if (sb.inode_size != INODE_SIZE) {
+        printf("[FIXING] Inode size corrected from %u to %u\n", sb.inode_size, INODE_SIZE);
+        sb.inode_size = INODE_SIZE; FIXING = 1;
+    }
+    if (sb.inode_count != INODE_COUNT) {
+        printf("[FIXING] Inode count corrected from %u to %u\n", sb.inode_count, INODE_COUNT);
+        sb.inode_count = INODE_COUNT; FIXING = 1;
+    }
+    if (FIXING) write_block(0, &sb);
+    else printf("[OK] Superblock is valid\n");
+}
+
+void fix_inode_bitmap() {
+    printf("[INFO] Checking inode bitmap...\n");
     for (int i = 0; i < INODE_COUNT; i++) {
-        if (inodes[i].valid && !inode_bitmap[i]) {
-            printf("Inode %d is valid but not marked in inode bitmap\n", i);
-            inode_bitmap_errors++;
-        } else if (!inodes[i].valid && inode_bitmap[i]) {
-            printf("Inode %d is marked in inode bitmap but is invalid\n", i);
-            inode_bitmap_errors++;
+        int valid = (inodes[i].links_count > 0 && inodes[i].dtime == 0);
+        int marked = (inode_bitmap[i / 8] >> (i % 8)) & 1;
+        if (valid && !marked) {
+            inode_bitmap[i / 8] |= (1 << (i % 8));
+            printf("[FIXING] Set inode %d as used in bitmap\n", i);
+        } else if (!valid && marked) {
+            inode_bitmap[i / 8] &= ~(1 << (i % 8));
+            printf("[FIXING] Cleared unused inode %d from bitmap\n", i);
         }
     }
-    printf("\n");
+    write_block(sb.inode_bitmap_block, inode_bitmap);
 }
 
-void check_data_bitmap() {
-    printf("=== DATA BITMAP CHECK ===\n");
-    for (int i = FIRST_DATA_BLOCK; i < TOTAL_BLOCKS; i++) {
-        if (data_block_ref_count[i] > 0 && !data_bitmap[i]) {
-            printf("Data block %d is used by an inode but not marked in data bitmap\n", i);
-            data_bitmap_errors++;
-        } else if (data_block_ref_count[i] == 0 && data_bitmap[i]) {
-            printf("Data block %d is marked in data bitmap but not used by any inode\n", i);
-            data_bitmap_errors++;
-        }
-    }
-    printf("\n");
-}
+void fix_data_bitmap_and_blocks() {
+    printf("[INFO] Checking data bitmap and block usage...\n");
+    memset(data_block_owner, 0, sizeof(data_block_owner));
+    int found_duplicates = 0;
+    int found_bad_blocks = 0;
 
-void check_duplicate_blocks() {
-    printf("=== DUPLICATE BLOCKS CHECK ===\n");
-    for (int i = FIRST_DATA_BLOCK; i < TOTAL_BLOCKS; i++) {
-        if (data_block_ref_count[i] > 1) {
-            printf("Data block %d is referenced by multiple inodes (%d times)\n", i, data_block_ref_count[i]);
-            duplicate_blocks++;
-        }
-    }
-    printf("\n");
-}
-
-void check_bad_blocks() {
-    printf("=== BAD BLOCKS CHECK ===\n");
     for (int i = 0; i < INODE_COUNT; i++) {
-        if (!inodes[i].valid) continue;
-        for (int j = 0; j < inodes[i].num_blocks; j++) {
-            int blk = inodes[i].block_refs[j];
-            if (blk < FIRST_DATA_BLOCK || blk >= TOTAL_BLOCKS) {
-                printf("Inode %d references an invalid block number: %d\n", i, blk);
-                bad_block_references++;
+        if (inodes[i].links_count == 0 || inodes[i].dtime != 0) continue;
+        uint32_t blk = inodes[i].direct_block;
+
+        if (blk == 0) continue; // unused block
+
+        if (blk >= sb.data_block_start && blk < TOTAL_BLOCKS) {
+            if (data_block_owner[blk] == 0) {
+                data_block_owner[blk] = i + 1; // first owner
+                data_bitmap[blk / 8] |= (1 << (blk % 8));
             } else {
-                data_block_ref_count[blk]++;
+                printf("[ERROR] Data block %u referenced by inode %d and inode %d\n", blk, data_block_owner[blk]-1, i);
+                found_duplicates = 1;
+                inodes[i].direct_block = 0;
+                printf("[FIXING] Removed duplicate reference from inode %d\n", i);
             }
+        } else {
+            printf("[ERROR] Inode %d references invalid data block %u\n", i, blk);
+            found_bad_blocks = 1;
+            inodes[i].direct_block = 0;
+            printf("[FIXING] Cleared invalid block reference in inode %d\n", i);
         }
     }
-    printf("\n");
-}
 
-void check_indirect_blocks() {
-    printf("=== INDIRECT BLOCK REFERENCES ===\n");
-    for (int i = 0; i < INODE_COUNT; i++) {
-        if (!inodes[i].valid) continue;
-        if (inodes[i].single_indirect >= FIRST_DATA_BLOCK && inodes[i].single_indirect < TOTAL_BLOCKS) {
-            printf("Inode %d references a single indirect block: %d\n", i, inodes[i].single_indirect);
-            indirect_blocks++;
-        }
-        if (inodes[i].double_indirect >= FIRST_DATA_BLOCK && inodes[i].double_indirect < TOTAL_BLOCKS) {
-            printf("Inode %d references a double indirect block: %d\n", i, inodes[i].double_indirect);
-            indirect_blocks++;
+    for (int i = sb.data_block_start; i < TOTAL_BLOCKS; i++) {
+        int marked = (data_bitmap[i / 8] >> (i % 8)) & 1;
+        if (!data_block_owner[i] && marked) {
+            data_bitmap[i / 8] &= ~(1 << (i % 8));
+            printf("[FIXING] Cleared unused block %d from bitmap\n", i);
         }
     }
-    printf("\n");
-}
 
-void check_orphaned_structures() {
-    printf("=== ORPHANED STRUCTURES ===\n");
-    for (int i = 0; i < INODE_COUNT; i++) {
-        if (inodes[i].valid && inodes[i].link_count == 0 && !inodes[i].deleted) {
-            printf("Inodes with 0 links and not deleted: %d\n", i);
-            orphaned_inodes++;
-        }
+    if (!found_duplicates) {
+        printf("[OK] No duplicate blocks found\n");
+    } else {
+        printf("[FIXING] Duplicate blocks found\n");
     }
-    for (int i = FIRST_DATA_BLOCK; i < TOTAL_BLOCKS; i++) {
-        if (data_bitmap[i] && data_block_ref_count[i] == 0) {
-            printf("Data blocks marked used but not referenced: %d\n", i);
-            orphaned_data_blocks++;
-        }
-    }
-    printf("\n");
-}
 
-void summary_report() {
-    printf("--- Summary Report ---\n");
-    printf("Superblock errors: %d\n", superblock_errors);
-    printf("Inode bitmap errors: %d\n", inode_bitmap_errors);
-    printf("Data bitmap errors: %d\n", data_bitmap_errors);
-    printf("Duplicate blocks found: %d\n", duplicate_blocks);
-    printf("Bad block references: %d\n", bad_block_references);
-    printf("Inodes found: %d\n", valid_inodes);
-    printf("Data blocks found: %d\n", used_data_blocks);
-    printf("Indirect blocks found: %d\n", indirect_blocks);
+    if (!found_bad_blocks) {
+        printf("[OK] No bad blocks found\n");
+    } else {
+        printf("[FIXING] Bad blocks found\n");
+    }
+
+    write_block(sb.data_bitmap_block, data_bitmap);
+    save_inodes();
 }
 
 int main() {
-    // Mocked superblock for example
-    Superblock sb = {
-        .magic_number = MAGIC_NUMBER,
-        .block_size = BLOCK_SIZE,
-        .total_blocks = TOTAL_BLOCKS,
-        .inode_bitmap_block = INODE_BITMAP_BLOCK,
-        .data_bitmap_block = DATA_BITMAP_BLOCK,
-        .inode_table_start = INODE_TABLE_START_BLOCK,
-        .first_data_block = FIRST_DATA_BLOCK,
-        .inode_size = INODE_SIZE,
-        .inode_count = INODE_COUNT
-    };
+    img = fopen("vsfs.img", "r+b");
+    if (!img) { perror("vsfs.img"); return 1; }
 
-    // Mock some inode data for testing (this would be parsed from the image)
-    inodes[3] = (Inode){.number = 3, .valid = true, .num_blocks = 2, .block_refs = {10, 13}, .link_count = 0, .deleted = false};
-    inodes[5] = (Inode){.number = 5, .valid = true, .num_blocks = 1, .block_refs = {13}, .link_count = 1, .deleted = false, .single_indirect = 12};
-    inodes[6] = (Inode){.number = 6, .valid = true, .num_blocks = 1, .block_refs = {11}, .link_count = 1, .deleted = false, .double_indirect = 15};
-    inodes[7] = (Inode){.number = 7, .valid = true, .num_blocks = 1, .block_refs = {70}, .link_count = 1, .deleted = false};
-    inodes[9] = (Inode){.number = 9, .valid = true, .num_blocks = 1, .block_refs = {2}, .link_count = 1, .deleted = false};
-    inodes[12] = (Inode){.number = 12, .valid = false};
+    load_data();
+    fix_superblock();
+    fix_inode_bitmap();
+    fix_data_bitmap_and_blocks();
 
-    inode_bitmap[12] = true;
-    data_bitmap[11] = true;
-
-    valid_inodes = 5; // manually counted valid ones
-    used_data_blocks = 4; // dummy number
-
-    // Run checks
-    print_superblock(sb);
-    check_inode_bitmap();
-    check_data_bitmap();
-    check_duplicate_blocks();
-    check_bad_blocks();
-    check_indirect_blocks();
-    check_orphaned_structures();
-    summary_report();
-
+    fclose(img);
+    printf("[SUMMARY] File system FIXING and saved.\n");
     return 0;
 }
